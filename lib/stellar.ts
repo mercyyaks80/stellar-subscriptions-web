@@ -165,6 +165,79 @@ export async function readContract<T>(
   return (retval ? scValToNative(retval) : undefined) as T;
 }
 
+/**
+ * Token metadata cache. Each distinct token otherwise costs three simulate
+ * calls (symbol, name, decimals) on every page load. We persist the result in
+ * `localStorage`, keyed by network + token address, with a short expiry so a
+ * token's metadata can still be refreshed. Every storage access is guarded so
+ * a missing / full / corrupt store never breaks the page.
+ */
+export interface TokenMetadata {
+  symbol: string;
+  name: string;
+  decimals: number;
+}
+
+const TOKEN_CACHE_PREFIX = "handsoff:token:";
+const TOKEN_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function tokenCacheKey(network: Network, tokenId: string): string {
+  return `${TOKEN_CACHE_PREFIX}${network}:${tokenId}`;
+}
+
+function getStorage(): Storage | null {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** Read cached token metadata, or `null` when absent, expired, or unreadable. */
+export function readTokenCache(network: Network, tokenId: string): TokenMetadata | null {
+  const storage = getStorage();
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(tokenCacheKey(network, tokenId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { data?: TokenMetadata; expires?: number };
+    if (!parsed || typeof parsed.expires !== "number" || parsed.expires < Date.now()) {
+      return null;
+    }
+    const data = parsed.data;
+    if (
+      !data ||
+      typeof data.symbol !== "string" ||
+      typeof data.name !== "string" ||
+      typeof data.decimals !== "number"
+    ) {
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist token metadata. Failures (quota, disabled storage) are swallowed. */
+export function writeTokenCache(
+  network: Network,
+  tokenId: string,
+  data: TokenMetadata,
+): void {
+  const storage = getStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(
+      tokenCacheKey(network, tokenId),
+      JSON.stringify({ data, expires: Date.now() + TOKEN_CACHE_TTL_MS }),
+    );
+  } catch {
+    // Storage full or unavailable — caching is best-effort only.
+  }
+}
+
 /** Everything a write needs: who signs, on which network, and progress. */
 export interface WriteCtx {
   network: Network;
@@ -241,29 +314,14 @@ export async function invokeContract(
 async function confirm(
   server: rpc.Server,
   hash: string,
-  timeoutMs = 60_000,
 ): Promise<rpc.Api.GetTransactionResponse> {
-  const started = Date.now();
-  for (;;) {
+  for (let attempt = 0; attempt < 30; attempt++) {
     const res = await withRetry(() => server.getTransaction(hash));
     if (res.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) return res;
-    if (Date.now() - started > timeoutMs) {
-      throw new ContractError(
-        "Still waiting for the network to confirm. It may yet succeed — check the explorer before retrying.",
-        hash,
-      );
-    }
-    await sleep(2_000);
+    await sleep(1000);
   }
-}
-
-export async function getLatestLedger(network: Network): Promise<number> {
-  const res = await withRetry(() => getServer(network).getLatestLedger());
-  return res.sequence;
-}
-
-/** Oldest and latest ledger the RPC node still holds events for. */
-export async function getEventWindow(network: Network): Promise<{ oldest: number; latest: number }> {
-  const health = await withRetry(() => getServer(network).getHealth());
-  return { oldest: health.oldestLedger, latest: health.latestLedger };
+  throw new ContractError(
+    "The transaction was submitted but hasn't confirmed yet. Check the explorer before retrying.",
+    hash,
+  );
 }
