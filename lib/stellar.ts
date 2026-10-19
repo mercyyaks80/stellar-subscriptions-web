@@ -116,7 +116,7 @@ export const arg = {
 const RETRIES = 3;
 
 /** Public RPC nodes rate-limit bursts; retry those, never contract errors. */
-async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt < RETRIES; attempt++) {
     try {
@@ -249,9 +249,9 @@ export interface WriteCtx {
 /**
  * Invoke a contract function as `ctx.source`. Simulates first, so a contract
  * rejection is reported before the wallet is ever asked to sign, then signs
- * through `ctx.sign`, submits, and waits for the ledger to confirm.
+ * through `ctx.sign` and submits. Returns the confirmed hash.
  */
-export async function invokeContract(
+export async function writeContract(
   ctx: WriteCtx,
   contractId: string,
   method: string,
@@ -259,69 +259,40 @@ export async function invokeContract(
   errors: ErrorTable,
 ): Promise<TxResult> {
   const server = getServer(ctx.network);
-  const passphrase = NETWORKS[ctx.network].passphrase;
-
-  ctx.onPhase?.("building");
-  const account = await withRetry(() => server.getAccount(ctx.source)).catch((e: unknown) => {
-    throw new ContractError(
-      "This account isn't funded on this network yet, so it can't send transactions.",
-      e instanceof Error ? e.message : String(e),
-    );
-  });
-  const built = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: passphrase })
+  const account = await withRetry(() => server.getAccount(ctx.source));
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORKS[ctx.network].passphrase,
+  })
     .addOperation(new Contract(contractId).call(method, ...args))
-    .setTimeout(120)
+    .setTimeout(30)
     .build();
 
-  const sim = await withRetry(() => server.simulateTransaction(built));
+  ctx.onPhase?.("simulating");
+  const sim = await withRetry(() => server.simulateTransaction(tx));
   if (rpc.Api.isSimulationError(sim)) throw explainError(sim.error, errors);
-  const prepared = rpc.assembleTransaction(built, sim).build();
+  rpc.assembleTransaction(tx, sim);
 
   ctx.onPhase?.("signing");
-  const signed = TransactionBuilder.fromXDR(await ctx.sign(prepared.toXDR()), passphrase);
+  const signed = await ctx.sign(tx.toXDR());
 
   ctx.onPhase?.("submitting");
-  const sent = await server.sendTransaction(signed);
-  if (sent.status === "ERROR" || sent.status === "TRY_AGAIN_LATER") {
-    throw new ContractError(
-      sent.status === "TRY_AGAIN_LATER"
-        ? "The network is busy. Nothing was charged — try again in a moment."
-        : "The network rejected the transaction. Nothing was changed.",
-      JSON.stringify(sent.errorResult ?? sent),
-    );
+  const sent = await withRetry(() => server.sendTransaction(TransactionBuilder.fromXDR(signed, NETWORKS[ctx.network].passphrase)));
+  if (sent.status === "ERROR") {
+    throw explainError(JSON.stringify(sent.errorResult ?? sent), errors);
   }
 
   ctx.onPhase?.("confirming");
-  const final = await confirm(server, sent.hash);
-  if (final.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
-    throw new ContractError(
-      "The transaction was included but failed, so nothing changed on-chain.",
-      `${sent.hash}: ${JSON.stringify(final.status)}`,
-    );
-  }
-
-  let returnValue: unknown;
-  if (final.returnValue) {
-    try {
-      returnValue = scValToNative(final.returnValue);
-    } catch {
-      returnValue = undefined;
-    }
-  }
-  return { hash: sent.hash, returnValue };
-}
-
-async function confirm(
-  server: rpc.Server,
-  hash: string,
-): Promise<rpc.Api.GetTransactionResponse> {
-  for (let attempt = 0; attempt < 30; attempt++) {
+  const hash = sent.hash;
+  for (let i = 0; i < 30; i++) {
     const res = await withRetry(() => server.getTransaction(hash));
-    if (res.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) return res;
+    if (res.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      return { hash, network: ctx.network };
+    }
+    if (res.status === rpc.Api.GetTransactionStatus.FAILED) {
+      throw explainError(JSON.stringify(res), errors);
+    }
     await sleep(1000);
   }
-  throw new ContractError(
-    "The transaction was submitted but hasn't confirmed yet. Check the explorer before retrying.",
-    hash,
-  );
+  throw new ContractError("The transaction is taking longer than expected to confirm.");
 }
